@@ -7,7 +7,9 @@ import torch
 from torch import Tensor
 from torch.utils.data import Dataset
 from transformers import PreTrainedTokenizerBase
-
+import random
+import json
+import gzip
 
 def run_tokenize_prompt_and_output(
     prompt_strs: list[str],
@@ -512,9 +514,60 @@ def get_packed_sft_dataset(
         "input_ids" contains the token IDs for the language modeling inputs, and "labels" contains
         the token IDs for the language modeling labels.
     """
-    raise NotImplementedError
+    return PackedSFTDataset(tokenizer, dataset_path, seq_length, shuffle)
 
+class PackedSFTDataset(Dataset):
+    def __init__(self, tokenizer, dataset_path, seq_length, shuffle=True):
+        examples = []
 
+        if str(dataset_path).endswith(".gz"):
+            f = gzip.open(dataset_path, "rt", encoding="utf-8")
+        else:
+            f = open(dataset_path, "r", encoding="utf-8")
+
+        for line in f:
+            ex = json.loads(line)
+            text = (
+                "Below is an instruction that describes a task. "
+                "Write a response that appropriately completes the request.\n\n"
+                "### Instruction:\n"
+                f"{ex['prompt']}\n\n"
+                "### Response:\n"
+                f"{ex['response']}"
+            )
+            examples.append(text)
+
+        f.close()
+
+        if shuffle:
+            random.shuffle(examples)
+
+        all_tokens = []
+
+        for text in examples:
+            tokens = tokenizer.encode(text, add_special_tokens=True)
+
+            if tokenizer.eos_token_id is not None:
+                tokens.append(tokenizer.eos_token_id)
+
+            all_tokens.extend(tokens)
+
+        self.input_ids = []
+        self.labels = []
+
+        for i in range(0, len(all_tokens) - seq_length, seq_length):
+            self.input_ids.append(all_tokens[i:i + seq_length])
+            self.labels.append(all_tokens[i + 1:i + seq_length + 1])
+
+    def __len__(self):
+        return len(self.input_ids)
+
+    def __getitem__(self, i):
+        return {
+            "input_ids": torch.tensor(self.input_ids[i], dtype=torch.long),
+            "labels": torch.tensor(self.labels[i], dtype=torch.long),
+        }
+    
 def run_iterate_batches(
     dataset: Dataset,
     batch_size: int,
@@ -535,7 +588,11 @@ def run_iterate_batches(
     Returns:
         Iterable over batches, where each batch has size `batch_size`.
     """
-    raise NotImplementedError
+    return torch.utils.data.DataLoader(
+    dataset,
+    batch_size=batch_size,
+    shuffle=shuffle,
+)
 
 
 def run_parse_mmlu_response(
@@ -578,50 +635,85 @@ def run_parse_mmlu_response(
 def run_parse_gsm8k_response(
     model_output: str,
 ) -> str | None:
-    """
-    Given a GSM8K model output, parse the model output into a predicted numeric answer by
-    taking the last number that occurs in the output.
 
-    model_output: str
-        str with the model's output to a GSM8K example.
+    import re
 
-    Returns:
-        str with the predicted numeric answer if the model output can be parsed into a prediction,
-        else None.
-    """
-    raise NotImplementedError
+    if model_output is None:
+        return None
+
+    text = model_output.lower()
+
+    patterns = [
+        r"the answer is (-?\d+\.?\d*)",
+        r"final answer[:\s]*(-?\d+\.?\d*)",
+        r"answer[:\s]*(-?\d+\.?\d*)"
+    ]
+
+    for pattern in patterns:
+        match = re.search(pattern, text)
+        if match:
+            try:
+                return match.group(1)
+            except:
+                return None
+
+    numbers = re.findall(r"-?\d+\.?\d*", text)
+    if numbers:
+        try:
+            return numbers[-1]
+        except:
+            return None
+
+    return None
 
 
 def run_compute_per_instance_dpo_loss(
-    lm: torch.nn.Module,
-    lm_ref: torch.nn.Module,
-    tokenizer: PreTrainedTokenizerBase,
-    beta: float,
-    prompt: str,
-    response_chosen: str,
-    response_rejected: str,
-) -> torch.Tensor:
-    """
-    Given two language models (`lm`, and the "reference model" `lm_ref`),
-    their tokenizer, the DPO beta hyperparameter, a prompt and a pair
-    of responses to the prompt, computes the value of the DPO loss for this example.
+    lm,
+    lm_ref,
+    tokenizer,
+    beta,
+    prompt,
+    response_chosen,
+    response_rejected,
+):
+    def seq_logprob(model, text):
+        full_text = (
+            "Below is an instruction that describes a task. "
+            "Write a response that appropriately completes the request.\n\n"
+            "### Instruction:\n"
+            f"{prompt}\n\n"
+            "### Response:\n"
+            f"{text}"
+        )
 
-    lm: torch.nn.Module
-        Language model being trained.
-    lm_ref: torch.nn.Module
-        Reference language model.
-    tokenizer: PreTrainedTokenizerBase
-        Tokenizer for both language models.
-    beta: float
-        DPO beta hyperparameter.
-    prompt: str
-        Prompt for this instance of preference pair.
-    response_chosen: str
-        Preferred response to the prompt.
-    response_rejected: str
-        Rejected response to the prompt.
+        if tokenizer.eos_token is not None:
+            full_text = full_text + tokenizer.eos_token
 
-    Returns:
-        torch.Tensor with the DPO loss for this example.
-    """
-    raise NotImplementedError
+        inputs = tokenizer(full_text, return_tensors="pt")
+        input_ids = inputs["input_ids"]
+
+        outputs = model(input_ids=input_ids)
+        logits = outputs.logits[:, :-1, :]
+        labels = input_ids[:, 1:]
+
+        log_probs = torch.log_softmax(logits, dim=-1)
+        token_log_probs = log_probs.gather(
+            dim=-1,
+            index=labels.unsqueeze(-1),
+        ).squeeze(-1)
+
+        return token_log_probs.sum()
+
+    chosen_logp = seq_logprob(lm, response_chosen)
+    rejected_logp = seq_logprob(lm, response_rejected)
+
+    with torch.no_grad():
+        chosen_ref_logp = seq_logprob(lm_ref, response_chosen)
+        rejected_ref_logp = seq_logprob(lm_ref, response_rejected)
+
+    policy_diff = chosen_logp - rejected_logp
+    ref_diff = chosen_ref_logp - rejected_ref_logp
+
+    loss = -torch.log(torch.sigmoid(beta * (policy_diff - ref_diff)))
+
+    return loss
